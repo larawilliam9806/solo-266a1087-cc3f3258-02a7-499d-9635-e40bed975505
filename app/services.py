@@ -73,10 +73,12 @@ def _build_manifest(batch_id: str) -> bytes:
             "original_study_uid", "new_study_uid",
             "original_series_uid", "new_series_uid",
             "original_sop_uid", "new_sop_uid", "sha256",
+            "source_transfer_syntax", "delivery_transfer_syntax",
         ])
         for f in files:
             inst = conn.execute(
-                "SELECT new_sop_uid, sha256 FROM instances WHERE sop_uid=?",
+                "SELECT new_sop_uid, sha256, source_transfer_syntax, "
+                "delivery_transfer_syntax FROM instances WHERE sop_uid=?",
                 (f["sop_uid"],),
             ).fetchone()
             study_new = conn.execute(
@@ -102,6 +104,8 @@ def _build_manifest(batch_id: str) -> bytes:
                 f["sop_uid"],
                 inst["new_sop_uid"],
                 inst["sha256"],
+                inst["source_transfer_syntax"],
+                inst["delivery_transfer_syntax"],
             ])
         # UTF-8 BOM，方便 Excel 直接打开中文
         return buf.getvalue().encode("utf-8-sig")
@@ -153,7 +157,8 @@ def run_batch(batch_id: str, saved: list[tuple[str, Path]]):
         conn.close()
     try:
         plan = dicom_proc.plan_batch(saved)
-        dicom_proc.persist_mappings(plan)
+        # process_plan 内部先完成全部转码/落盘，再统一写入映射与实例：
+        # 任一 RLE 解码/转码失败时不会产生任何新增实例或换号记录
         dicom_proc.process_plan(plan, batch_id)
         zip_path = _build_zip(batch_id, plan)
         conn = get_db()

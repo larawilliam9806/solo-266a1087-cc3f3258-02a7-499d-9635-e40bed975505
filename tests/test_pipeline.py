@@ -50,7 +50,7 @@ def test_full_batch_deidentification(client, sample_files):
     zf = _download_zip(client, batch_id)
     names = zf.namelist()
     assert "manifest.csv" in names
-    assert len([n for n in names if n.endswith(".dcm")]) == 4
+    assert len([n for n in names if n.endswith(".dcm")]) == 5
 
     out_ct1 = _read_member(zf, next(n for n in names if n.endswith(".dcm")
                                     and gen.SOP_CT_1 not in n))

@@ -20,7 +20,7 @@
 <section class="card">
   <h2 style="margin-top:0;">批次内文件</h2>
   <table>
-    <thead><tr><th>原文件名</th><th>原 PatientID</th><th>原 Study UID</th><th>原 Series UID</th><th>原 SOP UID</th></tr></thead>
+    <thead><tr><th>原文件名</th><th>原 PatientID</th><th>原 Study UID</th><th>原 Series UID</th><th>原 SOP UID</th><th>源传输语法</th><th>交付传输语法</th></tr></thead>
     <tbody>
     {% for f in files %}
       <tr>
@@ -29,6 +29,8 @@
         <td><code>{{ f.original_study_uid }}</code></td>
         <td><code>{{ f.original_series_uid }}</code></td>
         <td><code>{{ f.sop_uid }}</code></td>
+        <td><code>{{ f.source_transfer_syntax }}</code></td>
+        <td><code>{{ f.delivery_transfer_syntax }}</code></td>
       </tr>
     {% endfor %}
     </tbody>

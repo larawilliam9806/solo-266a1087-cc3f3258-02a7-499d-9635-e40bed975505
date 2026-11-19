@@ -3,9 +3,12 @@
 <section class="card">
   <h2 style="margin-top:0;">上传新批次</h2>
   <p class="muted">
-    仅接受<b>未压缩传输语法</b>的 DICOM 文件，可多选批量上传。处理规则：
-    清空 PatientName、替换 PatientID；Study/Series/SOP 三类 UID 及全部嵌套引用统一换号；
-    SOP Class UID、Transfer Syntax UID、像素数据保持原样。同 UID 字节冲突将整批拒绝。
+    接受<b>未压缩传输语法</b> DICOM（Implicit/Explicit VR Little Endian、Explicit VR Big Endian）
+    与<b>单帧 16 位灰度 RLE Lossless CT</b>，可与未压缩 DICOM 混传、多选批量上传。
+    RLE 实例在下载包中转码为 Explicit VR Little Endian（像素值、位深、符号与 CT 缩放参数保留，
+    文件元信息同步更新）。处理规则：清空 PatientName、替换 PatientID；
+    Study/Series/SOP 三类 UID 及全部嵌套引用统一换号；SOP Class UID、FrameOfReferenceUID 保持原样。
+    同 UID 字节冲突将整批拒绝；任一 RLE 实例解码或转码失败，整批不可下载且不新增实例或换号记录。
   </p>
   <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data">
     <p><input type="file" name="dicom_files" webkitdirectory multiple required></p>

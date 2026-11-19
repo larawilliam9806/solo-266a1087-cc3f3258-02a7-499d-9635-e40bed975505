@@ -62,7 +62,9 @@ def create_app() -> Flask:
         conn = get_db()
         try:
             files = conn.execute(
-                "SELECT * FROM batch_files WHERE batch_id=? ORDER BY orig_name",
+                "SELECT bf.*, i.source_transfer_syntax, i.delivery_transfer_syntax "
+                "FROM batch_files bf LEFT JOIN instances i ON bf.sop_uid = i.sop_uid "
+                "WHERE bf.batch_id=? ORDER BY bf.orig_name",
                 (batch_id,),
             ).fetchall()
         finally:

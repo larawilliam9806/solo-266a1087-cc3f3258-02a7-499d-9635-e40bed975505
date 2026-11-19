@@ -1,11 +1,16 @@
-"""DICOM 批处理核心：校验、标识收集、映射、匿名化重标识、落盘。
+"""DICOM 批处理核心：校验、标识收集、映射、匿名化重标识、RLE 转码、落盘。
 
 不变量：
 - 仅清空 PatientName、替换 PatientID；
 - 仅对 Study/Series/SOP 三类 UID 及其嵌套引用换号；
-- SOP Class UID、Transfer Syntax UID、FrameOfReferenceUID 等其他 UID 不动；
-- 像素数据与传输语法原样保留（只接受未压缩传输语法）；
-- 同字节实例复用既有结果，字节冲突整批拒绝。
+- SOP Class UID、FrameOfReferenceUID 等其他 UID 不动；
+- 未压缩实例的像素数据与传输语法原样保留；
+- 单帧 16 位灰度 RLE Lossless CT 转码为 Explicit VR Little Endian：
+  解码像素值、位深、符号与 CT 缩放（RescaleSlope/Intercept）全部保留，
+  文件元信息 TransferSyntaxUID 同步更新，PixelData 以显式 OW 落盘；
+- RLE 实例逐件解码、转码后立即释放解码数组，解码内存不随批内实例数增长；
+- 同字节实例复用既有结果，字节冲突整批拒绝；
+- 任一实例校验/解码/转码失败都在任何数据库写入之前抛出，整批拒绝。
 """
 from __future__ import annotations
 
@@ -15,7 +20,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pydicom
+from pydicom.dataelem import DataElement
 from pydicom.tag import Tag
+from pydicom.uid import (
+    CTImageStorage,
+    ExplicitVRLittleEndian,
+    RLELossless,
+)
 
 from . import config, identifiers
 from .db import get_db, immediate_tx
@@ -27,10 +38,17 @@ UNCOMPRESSED_TS = {
     "1.2.840.10008.1.2.2",    # Explicit VR Big Endian
 }
 
+# 唯一接受的压缩传输语法：RLE Lossless（仅限单帧 16 位灰度 CT，见 _validate_rle_ct）
+RLE_TS = str(RLELossless)
+# RLE 转码后的交付传输语法
+DELIVERY_TS = str(ExplicitVRLittleEndian)
+TAG_PIXEL_DATA = Tag(0x7FE0, 0x0010)
+
 # 三类身份标识标签
 TAG_STUDY_UID = Tag(0x0020, 0x000D)
 TAG_SERIES_UID = Tag(0x0020, 0x000E)
 TAG_SOP_UID = Tag(0x0008, 0x0018)
+TAG_SOP_CLASS = Tag(0x0008, 0x0016)
 TAG_PATIENT_ID = Tag(0x0010, 0x0020)
 TAG_PATIENT_NAME = Tag(0x0010, 0x0010)
 
@@ -40,7 +58,9 @@ ROLE_HINT_TAGS: dict[Tag, str] = {
     Tag(0x0008, 0x1155): "sop",   # Referenced SOP Instance UID
 }
 
-# 明确不换号的 UI 标签：类 UID、传输语法、帧参考 UID 等
+# 明确不换号的 UI 标签：类 UID、传输语法、帧参考 UID 等。
+# TransferSyntaxUID 不参与身份换号：未压缩实例原样保留，RLE 实例由
+# _transcode_rle_to_evrle 在转码时显式改写为 Explicit VR Little Endian。
 EXCLUDED_UI_TAGS = {
     Tag(0x0002, 0x0002),  # Media Storage SOP Class UID
     Tag(0x0002, 0x0010),  # Transfer Syntax UID
@@ -69,7 +89,10 @@ class PlannedFile:
     sop_uid: str
     patient_id: str
     ds: pydicom.Dataset
-    reused: bool = False          # 命中既有实例，直接复用对象存储文件
+    source_ts: str                 # 上传原件的传输语法（清单记录用）
+    delivery_ts: str               # 交付产物的传输语法（RLE 转 EVRLE，其余原样）
+    is_rle: bool = False           # 是否为需要转码的 RLE Lossless CT
+    reused: bool = False           # 命中既有实例，直接复用对象存储文件
     object_relpath: str = ""
 
 
@@ -120,7 +143,14 @@ def _ui_values(elem) -> list[str]:
     return [value]
 
 
-def _read_and_validate(path: Path) -> pydicom.Dataset:
+def _read_and_validate(path: Path) -> tuple[pydicom.Dataset, str, bool]:
+    """读取并校验上传文件。
+
+    返回 (数据集, 源传输语法 UID, 是否 RLE)。接受：
+    - 未压缩传输语法（Implicit/Explicit VR LE、Explicit VR BE）；
+    - 单帧、BitsAllocated=16、灰度的 RLE Lossless CT（后续转 EVRLE）。
+    其余压缩语法或不符合限定条件的 RLE 一律整批拒绝。
+    """
     try:
         ds = pydicom.dcmread(str(path), force=False)
     except Exception as exc:  # noqa: BLE001 - 统一转成批次拒绝
@@ -129,18 +159,112 @@ def _read_and_validate(path: Path) -> pydicom.Dataset:
     if not ds.file_meta or "TransferSyntaxUID" not in ds.file_meta:
         raise BatchRejected(f"{path.name} 缺少文件元信息或 TransferSyntaxUID")
     ts = str(ds.file_meta.TransferSyntaxUID)
-    if ts not in UNCOMPRESSED_TS:
+    if ts in UNCOMPRESSED_TS:
+        return ds, ts, False
+    if ts == RLE_TS:
+        _validate_rle_ct(path.name, ds)
+        return ds, ts, True
+    raise BatchRejected(
+        f"{path.name} 使用不支持的压缩传输语法 {ts}，"
+        "本服务仅接受未压缩 DICOM 与单帧 16 位灰度 RLE Lossless CT"
+    )
+
+
+def _validate_rle_ct(name: str, ds: pydicom.Dataset) -> None:
+    """校验 RLE 实例严格落在“单帧 16 位灰度 CT”的受理范围内。"""
+    sop_class = str(ds.SOPClassUID) if TAG_SOP_CLASS in ds else ""
+    meta_class = (
+        str(ds.file_meta.MediaStorageSOPClassUID)
+        if "MediaStorageSOPClassUID" in ds.file_meta
+        else ""
+    )
+    if CTImageStorage not in (sop_class, meta_class):
         raise BatchRejected(
-            f"{path.name} 使用压缩传输语法 {ts}，本服务仅接受未压缩 DICOM"
+            f"{name} 为 RLE Lossless 但不是 CT Image Storage 实例"
+            f"（SOPClassUID={sop_class or meta_class or '缺失'}），整批拒绝"
         )
-    for tag, name in (
-        (TAG_STUDY_UID, "StudyInstanceUID"),
-        (TAG_SERIES_UID, "SeriesInstanceUID"),
-        (TAG_SOP_UID, "SOPInstanceUID"),
+    if int(getattr(ds, "BitsAllocated", 0)) != 16:
+        raise BatchRejected(
+            f"{name} 的 BitsAllocated={getattr(ds, 'BitsAllocated', '缺失')}，"
+            "本服务仅接受 BitsAllocated=16 的 RLE CT，整批拒绝"
+        )
+    if int(getattr(ds, "SamplesPerPixel", 0)) != 1:
+        raise BatchRejected(
+            f"{name} 的 SamplesPerPixel={getattr(ds, 'SamplesPerPixel', '缺失')}，"
+            "本服务仅接受单样本灰度 RLE CT，整批拒绝"
+        )
+    photometric = str(getattr(ds, "PhotometricInterpretation", "")).upper()
+    if photometric not in ("MONOCHROME1", "MONOCHROME2"):
+        raise BatchRejected(
+            f"{name} 的 PhotometricInterpretation={photometric or '缺失'}，"
+            "本服务仅接受灰度（MONOCHROME1/2）RLE CT，整批拒绝"
+        )
+    nr_frames = int(getattr(ds, "NumberOfFrames", 1) or 1)
+    if nr_frames != 1:
+        raise BatchRejected(
+            f"{name} 为 {nr_frames} 帧 RLE 实例，本服务仅接受单帧 RLE CT，整批拒绝"
+        )
+    for tag, label in (
+        (Tag(0x0028, 0x0010), "Rows"),
+        (Tag(0x0028, 0x0011), "Columns"),
+        (TAG_PIXEL_DATA, "PixelData"),
     ):
-        if tag not in ds or not str(ds[tag].value):
-            raise BatchRejected(f"{path.name} 缺少必需标识 {name}")
-    return ds
+        if tag not in ds or ds[tag].value in (None, b""):
+            raise BatchRejected(f"{name} 缺少 {label}，无法转码，整批拒绝")
+    if int(getattr(ds, "PixelRepresentation", -1)) not in (0, 1):
+        raise BatchRejected(
+            f"{name} 的 PixelRepresentation={getattr(ds, 'PixelRepresentation', '缺失')}，"
+            "无法确定像素符号，整批拒绝"
+        )
+
+
+def transcode_rle_to_evrle(ds: pydicom.Dataset, name: str) -> None:
+    """把单帧 RLE Lossless CT 原地转码为 Explicit VR Little Endian。
+
+    - 经 pydicom RLE 处理器解码，像素值与 PixelRepresentation 决定的符号保持；
+    - 位深（BitsAllocated/Stored、HighBit）、CT 缩放（RescaleSlope/Intercept）
+      等像素相关属性一概不触碰；
+    - 文件元信息 TransferSyntaxUID 同步为 1.2.840.10008.1.2.1；
+    - PixelData 以显式小端 OW 元素写回，解码数组立即释放（不保留在数据集缓存中），
+      使解码像素的内存占用只与当前实例有关，不随批内实例数增长。
+    """
+    try:
+        arr = ds.pixel_array  # RLE 解码（单帧 -> 2D ndarray，dtype 随 PixelRepresentation）
+    except Exception as exc:  # noqa: BLE001 - 解码失败统一整批拒绝
+        raise BatchRejected(f"{name} RLE 像素解码失败: {exc}") from exc
+    try:
+        expected_bytes = int(ds.Rows) * int(ds.Columns) * int(ds.BitsAllocated) // 8
+        if arr.shape != (int(ds.Rows), int(ds.Columns)):
+            raise ValueError(
+                f"解码帧形状 {arr.shape} 与 Rows/Columns "
+                f"({ds.Rows},{ds.Columns}) 不一致"
+            )
+        if arr.dtype.itemsize * 8 != int(ds.BitsAllocated):
+            raise ValueError(
+                f"解码位深 {arr.dtype.itemsize * 8} 与 BitsAllocated "
+                f"{ds.BitsAllocated} 不一致"
+            )
+        # 显式小端序列化；dtype.kind（u/i）保留无符号/二补码符号语义
+        raw = arr.astype(f"<{arr.dtype.kind}{arr.dtype.itemsize}").tobytes()
+        if len(raw) != expected_bytes:
+            raise ValueError(
+                f"解码字节数 {len(raw)} 与期望 {expected_bytes} 不一致"
+            )
+        ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+        ds.is_little_endian = True
+        ds.is_implicit_VR = False
+        ds[TAG_PIXEL_DATA] = DataElement(TAG_PIXEL_DATA, "OW", raw)
+        # 立即释放解码缓存，避免逐件转码时所有解码像素在数据集上累积
+        for attr in ("_pixel_array", "_pixel_id"):
+            if hasattr(ds, attr):
+                delattr(ds, attr)
+        ds.is_decompressed = False
+    except BatchRejected:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 转码失败统一整批拒绝
+        raise BatchRejected(f"{name} RLE 转码失败: {exc}") from exc
+    finally:
+        del arr  # 引用计数即时回收解码数组
 
 
 def _object_relpath(new_sop_uid: str) -> str:
@@ -158,7 +282,7 @@ def plan_batch(tmp_files: list[tuple[str, Path]]) -> BatchPlan:
     conn = get_db()
     try:
         for orig_name, tmp_path in tmp_files:
-            ds = _read_and_validate(tmp_path)
+            ds, source_ts, is_rle = _read_and_validate(tmp_path)
             digest = sha256_file(tmp_path)
             study_uid = str(ds[TAG_STUDY_UID].value)
             series_uid = str(ds[TAG_SERIES_UID].value)
@@ -197,6 +321,10 @@ def plan_batch(tmp_files: list[tuple[str, Path]]) -> BatchPlan:
                 sop_uid=sop_uid,
                 patient_id=patient_id,
                 ds=ds,
+                source_ts=source_ts,
+                # RLE 实例交付为 EVRLE；未压缩实例传输语法保持原样
+                delivery_ts=DELIVERY_TS if is_rle else source_ts,
+                is_rle=is_rle,
                 reused=reused,
                 object_relpath=object_relpath,
             )
@@ -327,19 +455,35 @@ def persist_mappings(plan: BatchPlan) -> None:
 
 
 def process_plan(plan: BatchPlan, batch_id: str) -> None:
-    """执行计划：写对象存储、登记 instances/batch_files。先落盘后入库。
+    """执行计划：RLE 转码 -> 写对象存储 -> 映射/实例入库 -> 登记批次文件。
+
+    先落盘后入库，且所有像素解码/转码与对象写入都在任何数据库写入之前完成：
+    任一 RLE 实例解码或转码失败都会在这里抛出 BatchRejected，
+    不新增任何实例、映射或换号记录，整批不可下载。
+
+    RLE 逐件转码并即时释放解码数组，解码像素内存只与当前实例大小有关，
+    不随批内实例数增长。
 
     实例登记在 IMMEDIATE 事务内做“插入或哈希比对”，堵住两个进程同时首次
     提交同一 SOP 不同字节时 plan 阶段都未见历史记录的竞态窗口。
     """
+    # 阶段 1：转码 + 对象落盘（无任何数据库写入，失败可干净整批拒绝）
+    for pf in plan.files:
+        if pf.reused:
+            continue
+        _transform_dataset(pf.ds, plan)
+        if pf.is_rle:
+            transcode_rle_to_evrle(pf.ds, pf.orig_name)
+        new_sop = plan.uid_remap[pf.sop_uid]
+        pf.object_relpath = _object_relpath(new_sop)
+        _atomic_write_object(pf.ds, pf.object_relpath)
+
+    # 阶段 2：全部转码/落盘成功后，才持久化映射与实例
+    persist_mappings(plan)
+
     conn = get_db()
     try:
         for pf in plan.files:
-            if not pf.reused:
-                _transform_dataset(pf.ds, plan)
-                new_sop = plan.uid_remap[pf.sop_uid]
-                pf.object_relpath = _object_relpath(new_sop)
-                _atomic_write_object(pf.ds, pf.object_relpath)
             with immediate_tx(conn):
                 existing = conn.execute(
                     "SELECT sha256 FROM instances WHERE sop_uid=?",
@@ -348,12 +492,16 @@ def process_plan(plan: BatchPlan, batch_id: str) -> None:
                 if existing is None:
                     conn.execute(
                         "INSERT INTO instances"
-                        "(sop_uid, sha256, new_sop_uid, object_path) VALUES(?,?,?,?)",
+                        "(sop_uid, sha256, new_sop_uid, object_path, "
+                        "source_transfer_syntax, delivery_transfer_syntax) "
+                        "VALUES(?,?,?,?,?,?)",
                         (
                             pf.sop_uid,
                             pf.sha256,
                             plan.uid_remap[pf.sop_uid],
                             pf.object_relpath,
+                            pf.source_ts,
+                            pf.delivery_ts,
                         ),
                     )
                 elif existing["sha256"] != pf.sha256:

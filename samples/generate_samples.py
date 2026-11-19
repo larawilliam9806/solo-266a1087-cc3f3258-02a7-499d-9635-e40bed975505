@@ -1,7 +1,8 @@
-"""生成含跨文件引用的合成 DICOM 样例（未压缩 Explicit VR Little Endian）。
+"""生成含跨文件引用的合成 DICOM 样例（未压缩 Explicit VR Little Endian + RLE Lossless）。
 
 产物（输出到 samples/data/）：
   ct_001.dcm, ct_002.dcm   —— 两张 CT 图像，共享同一 Study/Series，带像素数据
+  ct_rle_001.dcm           —— 单帧 16 位灰度 RLE Lossless CT（上传后需转码为 EVRLE）
   rs_001.dcm               —— RT Structure Set，ReferencedFrameOfReferenceSequence
                               中引用两张 CT 的 SOPInstanceUID
   sr_001.dcm               —— SR 文档，ReferencedStudySequence/ReferencedSeriesSequence/
@@ -22,6 +23,7 @@ from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.uid import (
     CTImageStorage,
     ExplicitVRLittleEndian,
+    RLELossless,
     RTStructureSetStorage,
     EnhancedSRStorage,
     generate_uid,
@@ -36,8 +38,10 @@ SOP_CT_1 = "1.2.826.0.1.9999.7777.4001"
 SOP_CT_2 = "1.2.826.0.1.9999.7777.4002"
 SOP_RT = "1.2.826.0.1.9999.7777.4003"
 SOP_SR = "1.2.826.0.1.9999.7777.4004"
+SOP_CT_RLE = "1.2.826.0.1.9999.7777.4005"
 SERIES_RT_UID = "1.2.826.0.1.9999.7777.2002"
 SERIES_SR_UID = "1.2.826.0.1.9999.7777.2003"
+SERIES_RLE_UID = "1.2.826.0.1.9999.7777.2004"
 
 
 def _file_meta(sop_class: str, sop_uid: str) -> FileMetaDataset:
@@ -98,6 +102,42 @@ def make_ct(path: Path, sop_uid: str, instance_number: int, pixel_seed: int) -> 
     pixels = (rng.integers(0, 2000, size=(rows, cols), dtype=np.uint16)
               + np.tile(np.arange(cols, dtype=np.uint16), (rows, 1)))
     ds.PixelData = pixels.astype("<u2").tobytes()
+    _write(ds, path)
+
+
+def make_rle_ct(path: Path, sop_uid: str, instance_number: int, pixel_seed: int) -> None:
+    """生成单帧 16 位灰度 RLE Lossless CT（含 CT 缩放参数与二补码有符号像素）。"""
+    meta = _file_meta(CTImageStorage, sop_uid)
+    meta.TransferSyntaxUID = RLELossless
+    ds = FileDataset(str(path), Dataset(), file_meta=meta, preamble=b"\0" * 128)
+    _patient_study(ds)
+    ds.Modality = "CT"
+    ds.SeriesInstanceUID = SERIES_RLE_UID
+    ds.SOPClassUID = CTImageStorage
+    ds.SOPInstanceUID = sop_uid
+    ds.SeriesNumber = 4
+    ds.InstanceNumber = instance_number
+    ds.FrameOfReferenceUID = FRAME_OF_REF_UID
+    ds.ImagePositionPatient = [0.0, 0.0, float(instance_number) * 5.0]
+    ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
+    ds.SliceThickness = 5.0
+    ds.PixelSpacing = [0.7, 0.7]
+    rows, cols = 64, 64
+    ds.Rows = rows
+    ds.Columns = cols
+    ds.BitsAllocated = 16
+    ds.BitsStored = 16
+    ds.HighBit = 15
+    ds.PixelRepresentation = 1  # 有符号二补码，验证符号保留
+    ds.SamplesPerPixel = 1
+    ds.PhotometricInterpretation = "MONOCHROME2"
+    # CT 缩放参数，验证转码后逐值保留
+    ds.RescaleIntercept = -1024.0
+    ds.RescaleSlope = 1.0
+    rng = np.random.default_rng(pixel_seed)
+    pixels = rng.integers(-1000, 1000, size=(rows, cols), dtype=np.int16)
+    # RLE 压缩封装（pydicom 内置 RLE 编码器，仅依赖 numpy）
+    ds.compress(RLELossless, pixels)
     _write(ds, path)
 
 
@@ -217,9 +257,10 @@ def main(out_dir: Path) -> None:
     out_dir.mkdir(parents=True)
     make_ct(out_dir / "ct_001.dcm", SOP_CT_1, 1, pixel_seed=11)
     make_ct(out_dir / "ct_002.dcm", SOP_CT_2, 2, pixel_seed=22)
+    make_rle_ct(out_dir / "ct_rle_001.dcm", SOP_CT_RLE, 1, pixel_seed=33)
     make_rtstruct(out_dir / "rs_001.dcm")
     make_sr(out_dir / "sr_001.dcm")
-    print(f"已生成 4 个合成 DICOM 样例（含跨文件引用）到 {out_dir}")
+    print(f"已生成 5 个合成 DICOM 样例（含跨文件引用与 RLE Lossless CT）到 {out_dir}")
 
 
 if __name__ == "__main__":

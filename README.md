@@ -1,7 +1,8 @@
-# DICOM 影像批处理服务（匿名化 / 重标识）
+# DICOM 影像批处理服务（匿名化 / 重标识 / RLE 转码）
 
 影像数据管理员将导出的 DICOM 整理为供研究数据湖关联使用的副本。本服务提供网页批量上传
-未压缩 DICOM、统一换号处理、并下载整批处理结果（zip）的能力。
+未压缩 DICOM 与扫描仪导出的单帧 16 位灰度 RLE Lossless CT、统一换号处理、
+将 RLE 实例转码为未压缩影像，并下载整批处理结果（zip）的能力。
 
 ## 处理规则
 
@@ -14,10 +15,31 @@
 | `StudyInstanceUID` / `SeriesInstanceUID` / `SOPInstanceUID` | **统一换号** |
 | 上述三类 UID 的**全部嵌套引用**（序列内、文件元信息内） | 同步换号 |
 | 文件元信息 `MediaStorageSOPInstanceUID` | 与新 `SOPInstanceUID` 同步 |
-| SOP Class UID、Transfer Syntax UID、Implementation Class UID | **保持原样** |
+| SOP Class UID、Implementation Class UID | **保持原样** |
 | `FrameOfReferenceUID` 等其他非身份 UID | **保持原样** |
-| 像素数据（PixelData） | **逐字节保持原样** |
-| 传输语法 | 仅接受未压缩（Implicit/Explicit VR LE、Explicit VR BE），压缩语法整批拒绝 |
+| 未压缩实例的像素数据（PixelData） | **逐字节保持原样** |
+| 未压缩实例的传输语法 | 仅接受 Implicit/Explicit VR LE、Explicit VR BE，**保持原样** |
+| RLE Lossless CT 的像素数据 | **解码后以 Explicit VR Little Endian 重新封装**（OW），解码像素值逐值保留 |
+| RLE 实例的传输语法 | 文件元信息 `TransferSyntaxUID` 同步改为 `1.2.840.10008.1.2.1` |
+| 位深 / 符号 / CT 缩放 | `BitsAllocated/BitsStored/HighBit`、`PixelRepresentation`、`RescaleSlope/Intercept` 全部保留 |
+| 其他压缩传输语法（JPEG、JPEG-LS、JPEG 2000、deflated 等） | 整批拒绝 |
+
+### RLE Lossless CT 受理范围与转码
+
+网页上传允许 RLE 实例与现有未压缩 DICOM **混传**，但 RLE 实例必须同时满足：
+
+- 传输语法为 RLE Lossless（`1.2.840.10008.1.2.5`）；
+- SOP Class 为 CT Image Storage；
+- `BitsAllocated = 16`、`SamplesPerPixel = 1`、灰度（`MONOCHROME1/2`）；
+- 单帧（无 `NumberOfFrames` 或其值为 1）。
+
+不满足任一条件的 RLE 实例整批拒绝。转码由 pydicom 内置 RLE 处理器（仅依赖 numpy）
+逐件完成：解码数组在转码写回后立即释放，**解码像素的内存占用只与当前实例大小有关，
+不随批内实例数增长**。任一 RLE 实例解码或转码失败时：
+
+- 批次详情页与上传提示指出**出错文件名**与原因；
+- 整批标记 `failed`，不提供下载（下载返回 409），也不产生 zip；
+- 不新增任何实例、UID/患者映射（换号）记录——所有转码与对象落盘都先于数据库写入。
 
 ### UID 换号如何保证一致
 
@@ -31,32 +53,37 @@
 
 ## 数据完整性与可靠性保证
 
-1. **同字节复用**：同一 `SOPInstanceUID` 且原文件 SHA-256 相同，直接复用既有处理结果。
+1. **同字节复用**：同一 `SOPInstanceUID` 且原文件 SHA-256 相同，直接复用既有处理结果
+   （RLE 实例不会重复解码转码）。
 2. **字节冲突整批拒绝**：同一 `SOPInstanceUID` 但字节不同，整个批次标记 `failed`，
    不产生任何可下载产物。并发首次提交的竞态由 IMMEDIATE 事务内的哈希比对兜底。
-3. **无半批可下载**：批次只有在全部文件处理、入库、zip 打包并原子 rename 成功后才置为 `ready`；
-   zip 先写临时文件再 `os.replace`，失败/中断的批次下载返回 409。
-4. **重启恢复**：进程启动时将遗留的 `processing` 批次标记 `failed`；已成功入库的实例与映射
+3. **无半批可下载**：批次只有在全部文件校验、RLE 转码、入库、zip 打包并原子 rename
+   成功后才置为 `ready`；zip 先写临时文件再 `os.replace`，失败/中断的批次下载返回 409。
+4. **转码失败零写入**：RLE 解码/转码与对象落盘全部成功之前不写任何业务表，
+   失败批次不新增实例、不新增换号记录。
+5. **重启恢复**：进程启动时将遗留的 `processing` 批次标记 `failed`；已成功入库的实例与映射
    **保留不丢**，重新上传即可复用且标识不变。
-5. **重试不变号**：确定性派生 + 映射表只插入不更新（`INSERT OR IGNORE`），重试绝不改变标识。
-6. **先落盘后入库**：对象文件 `fsync` + 原子 rename 后才写数据库记录。
+6. **重试不变号**：确定性派生 + 映射表只插入不更新（`INSERT OR IGNORE`），重试绝不改变标识。
+7. **先落盘后入库**：对象文件 `fsync` + 原子 rename 后才写数据库记录。
+8. **清单可追溯**：`manifest.csv` 持续记录**上传原件**的 SHA-256，并逐件注明
+   `source_transfer_syntax`（源传输语法）与 `delivery_transfer_syntax`（交付传输语法）。
 
 ## 目录结构
 
 ```
 app/
   config.py        环境变量配置（数据目录、UID 前缀、上传大小、SQLite 超时）
-  db.py            SQLite 连接、WAL、建表、中断恢复
+  db.py            SQLite 连接、WAL、建表、传输语法列迁移、中断恢复
   identifiers.py   确定性 UID / PatientID 派生
-  dicom_proc.py    DICOM 校验、标识收集、映射、匿名化重标识、对象落盘
+  dicom_proc.py    DICOM 校验、RLE CT 受理校验与转码、标识收集、映射、匿名化重标识、对象落盘
   services.py      批次编排、zip 原子打包、CSV 清单、状态机
   web.py           Flask 路由与应用工厂
   wsgi.py          gunicorn 入口
   templates/       上传页、批次详情页
 samples/
-  generate_samples.py  合成样例生成器（含跨文件引用）
-  data/                生成的 4 个样例 DICOM
-tests/             pytest 测试（含多进程并发与中断恢复）
+  generate_samples.py  合成样例生成器（含跨文件引用与 RLE Lossless CT）
+  data/                生成的 5 个样例 DICOM
+tests/             pytest 测试（含多进程并发、中断恢复与 RLE 转码）
 Dockerfile
 docker-compose.yml
 ```
@@ -83,10 +110,10 @@ docker compose up --build
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 
-# 生成含跨文件引用的合成样例
+# 生成含跨文件引用与 RLE CT 的合成样例
 python samples/generate_samples.py
 
-# 运行测试（15 个，含多进程并发）
+# 运行测试（33 个，含多进程并发、RLE 转码与解码内存约束）
 pytest -q
 
 # 本地启动
@@ -114,13 +141,16 @@ DICOM_DATA_DIR=./data python -m flask --app app.wsgi:app run --debug
 | GET | `/healthz` | 健康检查 |
 
 下载的 zip 内含处理后的 DICOM（以新 SOP UID 命名）与 `manifest.csv`，
-清单列出每个文件的原/新 PatientID、三级 UID 映射及原文件 SHA-256，供数据湖关联。
+清单列出每个文件的原/新 PatientID、三级 UID 映射、**上传原件** SHA-256，
+以及源/交付传输语法，供数据湖关联与转码审计。
 
 ## 合成样例说明
 
-`samples/generate_samples.py` 生成 4 个未压缩 Explicit VR Little Endian 文件：
+`samples/generate_samples.py` 生成 5 个样例文件：
 
-- `ct_001.dcm` / `ct_002.dcm`：两张 64×64 带像素的 CT，共享 Study/Series；
+- `ct_001.dcm` / `ct_002.dcm`：两张 64×64 带像素的未压缩 CT，共享 Study/Series；
+- `ct_rle_001.dcm`：单帧 16 位有符号 RLE Lossless CT（含 `RescaleSlope/Intercept`），
+  上传后转码为 Explicit VR Little Endian；
 - `rs_001.dcm`：RT Structure Set，经 `ReferencedFrameOfReferenceSequence`
   → `RTReferencedStudySequence` → `ContourImageSequence` 跨文件引用两张 CT 的 SOP UID；
 - `sr_001.dcm`：Enhanced SR，含 `ReferencedStudySequence`、`ReferencedSeriesSequence`、

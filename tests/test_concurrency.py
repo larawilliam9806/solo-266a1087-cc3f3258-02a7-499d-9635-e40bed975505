@@ -123,6 +123,6 @@ def test_cross_process_identical_batches(app, sample_files):
             "GROUP BY original_uid HAVING c > 1"
         ).fetchall()
         assert dup == []
-        assert conn.execute("SELECT COUNT(*) c FROM instances").fetchone()["c"] == 4
+        assert conn.execute("SELECT COUNT(*) c FROM instances").fetchone()["c"] == 5
     finally:
         conn.close()

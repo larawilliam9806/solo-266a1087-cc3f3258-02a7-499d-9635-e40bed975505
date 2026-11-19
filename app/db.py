@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS instances (
     sha256         TEXT NOT NULL,
     new_sop_uid    TEXT NOT NULL UNIQUE,
     object_path    TEXT NOT NULL,              -- 处理结果在对象存储中的相对路径
+    source_transfer_syntax   TEXT NOT NULL DEFAULT '',  -- 上传原件传输语法
+    delivery_transfer_syntax TEXT NOT NULL DEFAULT '',  -- 交付产物传输语法
     created_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -93,8 +95,28 @@ def init_db() -> None:
     conn = get_db()
     try:
         conn.executescript(SCHEMA)
+        _migrate_instance_transfer_syntax(conn)
     finally:
         conn.close()
+
+
+def _migrate_instance_transfer_syntax(conn: sqlite3.Connection) -> None:
+    """为升级前已存在的 instances 表补齐传输语法列（幂等）。
+
+    旧库的 CREATE TABLE IF NOT EXISTS 不会自动加列，这里按现有列集合做
+    ADD COLUMN；历史行以空串占位，新上传的实例始终带真实值。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(instances)")}
+    if "source_transfer_syntax" not in cols:
+        conn.execute(
+            "ALTER TABLE instances ADD COLUMN source_transfer_syntax "
+            "TEXT NOT NULL DEFAULT ''"
+        )
+    if "delivery_transfer_syntax" not in cols:
+        conn.execute(
+            "ALTER TABLE instances ADD COLUMN delivery_transfer_syntax "
+            "TEXT NOT NULL DEFAULT ''"
+        )
 
 
 def recover_interrupted_batches() -> list[str]:
